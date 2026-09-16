@@ -1,8 +1,8 @@
 # Job Queue Dashboard
 
-A small job queue management dashboard: a NestJS + SQLite API and a React
-dashboard on top of it. Built for the AIRTH React + NestJS intern
-assignment.
+Small job queue management dashboard built for the AIRTH React + NestJS
+intern assignment — a NestJS API backed by SQLite, and a React dashboard
+on top of it.
 
 - **Backend:** `backend/` — NestJS, TypeORM, SQLite (`better-sqlite3`)
 - **Frontend:** `frontend/` — React + TypeScript (Vite)
@@ -14,14 +14,15 @@ assignment.
 | Frontend | https://frontend-beta-inky-m3homacvo4.vercel.app/ |
 | Backend API | https://airth-anshul.onrender.com |
 
-Backend is on Render's free tier, so it spins down after ~15 minutes idle —
-the first request after a gap can take 30-50s to wake up.
+Backend is on Render's free tier, so it sleeps after ~15 minutes of no
+traffic. First request after that takes 30-50s to wake back up — that's
+Render, not a bug.
 
-## Running locally
+## Running it locally
 
-Requires Node.js 20+.
+Needs Node 20+.
 
-### Backend
+**Backend**
 
 ```bash
 cd backend
@@ -29,10 +30,11 @@ npm install
 npm run start:dev    # http://localhost:3000
 ```
 
-SQLite persists to `backend/jobs.sqlite` (created automatically, git-ignored).
-Override with `DATABASE_PATH` and the port with `PORT`.
+SQLite file gets created at `backend/jobs.sqlite` automatically (it's
+git-ignored). You can override the path with `DATABASE_PATH` and the port
+with `PORT` if you need to.
 
-### Frontend
+**Frontend**
 
 ```bash
 cd frontend
@@ -40,196 +42,166 @@ npm install
 npm run dev           # http://localhost:5173
 ```
 
-By default the frontend talks to `http://localhost:3000`. To point it at a
-different API (e.g. a deployed backend), copy `.env.example` to `.env.local`
+It points at `http://localhost:3000` by default. If you want it hitting a
+different API (like the deployed one), copy `.env.example` to `.env.local`
 and set `VITE_API_URL`.
 
 ## API
 
-| Method | Path | Description |
+| Method | Path | What it does |
 |---|---|---|
-| `POST` | `/jobs` | Create a job (`{ title, type }`), status starts at `pending` |
-| `GET` | `/jobs` | List jobs, optional `?status=pending\|running\|completed\|failed` |
-| `PATCH` | `/jobs/:id/status` | Change status (`{ status }`) |
+| `POST` | `/jobs` | Create a job — `{ title, type }`, starts as `pending` |
+| `GET` | `/jobs` | List jobs, optionally `?status=pending\|running\|completed\|failed` |
+| `PATCH` | `/jobs/:id/status` | Change status — `{ status }` |
 | `DELETE` | `/jobs/:id` | Delete a job |
 
-A job is `{ id, title, type, status, createdAt }` (plus an internal,
-optional `idempotencyKey` — see [Bonus](#bonus-idempotency-key-on-job-creation)).
+Job shape: `{ id, title, type, status, createdAt }` (there's also an
+internal `idempotencyKey` field, see the bonus section below).
 
-Errors return `{ statusCode, message, path, timestamp }`:
+Errors come back as `{ statusCode, message, path, timestamp }`:
 
-- `400` — bad input (missing/invalid `title`, `type`, or `status` value)
-- `404` — job not found
-- `409` — the status changed underneath the request (see below)
-- `422` — the requested status transition isn't legal from the job's current status
+- `400` — bad input (missing title/type, garbage status value)
+- `404` — job doesn't exist
+- `409` — someone else changed this job's status first, try again
+- `422` — the status change you're asking for isn't a legal move from where the job currently is
 
-## Data model & the state machine
+## The state machine
 
 ```
 pending → running → completed
                    ↘ failed
 ```
 
-`completed` and `failed` are terminal — nothing can leave them, and
-`running` can't be re-entered once a job has completed or failed.
+`completed` and `failed` are dead ends — once a job lands there it can't
+move anywhere else, and it definitely can't go back to `running`.
 
-## Think About This: concurrency
+## The concurrency question (two tabs, same job)
 
-The assignment's scenario: two browser tabs both see a job as `pending` and
-both try to move it to `running` at nearly the same time.
+This was the main thing the assignment wanted me to think through, so
+here's my reasoning:
 
-**Where the rule is enforced.** Entirely on the server
-(`backend/src/jobs/jobs.service.ts`). The frontend also disables buttons for
-transitions it knows are illegal (e.g. it won't render a "Mark running"
-button on a `completed` job), but that's a UX nicety, not the source of
-truth — it just avoids sending requests the API would reject anyway.
+**Where should the rule live?** On the server, full stop. The frontend does
+disable buttons for moves it already knows are illegal (you won't even see
+a "mark running" button on a completed job), but that's just to avoid
+firing off requests that would get rejected anyway — it's not what's
+actually protecting the data.
 
-**If someone bypasses the React app and calls the API directly.** They hit
-the exact same validation the UI goes through, because there is no separate
-"UI-only" path. `PATCH /jobs/:id/status` re-reads the job's current status
-from the database and checks it against a single transition table
-(`pending → [running]`, `running → [completed, failed]`, everything else →
-`[]`) before doing anything else. An illegal transition — `pending →
-completed`, `completed → running`, a nonsense status string, etc. — gets a
-`422`/`400` regardless of who or what sent the request.
+**What if someone skips the UI and hits the API directly?** They go through
+exactly the same check the frontend's requests do, because there isn't a
+separate path for "trusted UI request" vs "raw API call." Every
+`PATCH /jobs/:id/status` re-reads the job's current status from the DB and
+checks it against one transition table before touching anything. Try to
+jump `pending` straight to `completed`, or push a `completed` job back to
+`running`, and you get a `422` no matter how the request was made.
 
-**Two requests arriving at nearly the same time.** This is the part that a
-"read the job, check the rule, then write" implementation gets wrong: two
-requests can both read `pending`, both pass the transition check, and both
-write `running` — one silently clobbering the other, or (worse, e.g.
-`running → completed` and `running → failed` racing) leaving the row's final
-state dependent on write order instead of business logic.
+**What actually happens with two simultaneous requests?** This is the part
+that's easy to get subtly wrong. If you write the obvious version — read
+the job, check if the transition is legal, then write the new status — two
+requests can both read `pending`, both pass the check, and both write
+`running`. One of them just silently overwrites the other and you'd never
+know it happened.
 
-The fix is to not trust the read by the time the write happens. The update
-is a single conditional SQL statement:
+To avoid that, the update itself isn't "read then write," it's one
+conditional SQL statement:
 
 ```sql
 UPDATE jobs SET status = :newStatus
 WHERE id = :id AND status = :statusWeReadEarlier
 ```
 
-(`jobs.service.ts`, `updateStatus`). This is an atomic compare-and-swap done
-by the database, not the application. Whichever request's `UPDATE` runs
-first wins and `affected = 1`. The second request's `WHERE` clause no longer
-matches — `affected = 0` — and the service reports it as `409 Conflict`
-("job was already updated by another request, refresh and try again")
-instead of silently overwriting the winner or double-applying the
-transition. No in-memory locks, no distributed lock manager, no
-`SELECT ... FOR UPDATE` transaction needed — the row itself is the lock.
+(see `updateStatus` in `backend/src/jobs/jobs.service.ts`). Whichever
+request's `UPDATE` actually runs first wins, and its `WHERE` clause still
+matches, so it succeeds. By the time the second request's `UPDATE` runs,
+the row's status has already moved — its `WHERE` clause no longer matches
+anything, `affected` comes back `0`, and the service turns that into a
+`409` instead of quietly clobbering the winner. The database row is
+basically doing the locking for you, no extra lock table or queue needed.
 
-In this project's SQLite setup specifically, `better-sqlite3` executes
-queries synchronously and the whole app runs in a single Node process, so in
-practice one request's read-then-write finishes before the next one starts
-and you'll usually see a `422` (racer B reads the *already-updated* row and
-fails the transition check) rather than a `409` (racer B's `UPDATE` loses
-the compare-and-swap). Both outcomes are safe — neither one can move the job
-into an invalid state — but the `409` path is what actually matters once you
-scale beyond one process: multiple API instances behind a load balancer, or
-Postgres with a real connection pool, where two requests' reads genuinely
-overlap in time. The `WHERE status = :expected` guard is what makes the
-system correct under that condition, not the accident of single-threaded
-SQLite.
+One thing worth being upfront about: because this app runs on SQLite via
+`better-sqlite3`, which executes queries synchronously in a single Node
+process, in practice you'll usually see a `422` in this race rather than a
+`409` — the second request's *read* happens after the first request's
+*write* has already landed, so it just fails the transition check instead
+of losing the compare-and-swap. I actually tested this with two parallel
+requests hitting the same job and that's exactly what I saw. Both outcomes
+are safe (nothing gets double-applied either way), but the `409` path is
+the one that matters once you're not running a single process anymore —
+multiple API instances behind a load balancer, or Postgres with a real
+connection pool, where two requests' reads can genuinely overlap. The
+`WHERE status = :expected` guard is what makes that case correct, the
+single-process SQLite behavior is just a side effect of this project's
+scale.
 
-**Preventing invalid/inconsistent state in general.** Three layers, cheapest
-first:
-
-1. `class-validator` DTOs reject malformed input before it reaches any
-   business logic (`400`).
-2. The transition table is the single source of truth for "is this move
-   legal," checked server-side on every request (`422`).
-3. The conditional `UPDATE` closes the read/write race so "legal when I
-   checked" and "still legal when I write" can't diverge (`409`).
-
-I did not reach for a distributed lock, a message queue, or
-`SERIALIZABLE` transactions — for a queue of this size a single
-compare-and-swap update is enough, and it's the same pattern that scales
-cleanly to Postgres with multiple API instances without changing the logic
-at all (only the driver changes).
+**So, three things are doing the work here, cheapest first:** input
+validation catches garbage before it's even considered (`400`), the
+transition table decides what's legal (`422`), and the conditional update
+closes the race between "legal when I checked" and "legal when I actually
+write" (`409`). I didn't reach for anything heavier than that — no
+distributed locks, no message queue — a job queue this size doesn't need
+it, and the same pattern carries over to Postgres without changing any
+logic, just the driver.
 
 ## Bonus: Idempotency-Key on job creation
 
-A job queue is exactly the kind of system where a client (a flaky network,
-an impatient double-click, a retried request after a timeout) can end up
-calling `POST /jobs` twice for what should be one job. Silently creating two
-identical jobs is a realistic production bug, and it's the same "duplicate
-request" class of problem as the concurrency question above, just on create
-instead of update.
+A job queue is a pretty natural place for a client to accidentally send the
+same "create job" request twice — flaky network, a retry after a timeout,
+a double click before a button disables. Silently ending up with two
+identical jobs is a real bug, not a hypothetical one.
 
-`POST /jobs` accepts an optional `Idempotency-Key` header. The first request
-with a given key creates the job and stores the key on the row (unique
-index). Any later request with the same key returns the original job
-instead of creating a new one — including two copies of the same request
-racing each other, which is handled by catching the unique-constraint
-violation and re-reading the winning row rather than failing the loser.
-It's a small addition (one column, one unique index, one extra branch in
-`create()`), but it's the kind of thing that matters the moment a real
-client (or a retrying `fetch`) is involved. The frontend in this repo
-doesn't send the header — it's exposed for API consumers, same as a real
-job-submission client would use it.
+`POST /jobs` accepts an optional `Idempotency-Key` header. First request
+with a given key creates the job and stores the key (unique index on the
+column). Send the same key again and you get the original job back instead
+of a duplicate — including if two copies of the same request race each
+other, which is handled by catching the unique constraint violation and
+just re-reading the row that won instead of erroring out. It's a small
+change (one column, one index, a couple extra lines in `create()`), but it
+felt like the more realistic "production-readiness" gap for this specific
+kind of system, compared to something more generic. The frontend here
+doesn't send the header itself — it's there for API consumers, the same
+way an actual job-submitting service would use it.
 
 ## Assumptions & trade-offs
 
-- **SQLite over Postgres.** The assignment allows either; SQLite needs no
-  external service to run or deploy, which fits the "small dashboard, two
-  day deadline" scope. The concurrency fix (conditional `UPDATE`) is
-  identical under Postgres — swapping the TypeORM driver is the only change
-  that would be needed to move to it.
-- **No auth.** Out of scope per the assignment; every endpoint is open.
-  In a real deployment `job type` would likely be scoped to a user/tenant.
-- **No pagination on `GET /jobs`.** Fine at dashboard scale; would add
-  `limit`/`cursor` before this saw real job volume.
-- **Filtering is a single `status` query param**, not a general query
-  language — matches the one filter the UI actually needs.
-- **Delete is hard delete**, not a soft-delete/audit trail. Simpler for
-  this scope; would reconsider for a system where "who deleted what" needs
-  to be answerable later.
-- **Frontend re-syncs the full list on a failed status change or delete**
-  (409/404) rather than trying to patch state locally, so the UI can never
-  drift from the server after a conflict.
+- **SQLite instead of Postgres.** Both were allowed, and SQLite meant no
+  extra service to spin up for a two-day assignment. The concurrency fix
+  doesn't change at all under Postgres — it's the same `UPDATE ... WHERE`
+  pattern, just a different driver.
+- **No auth.** Not asked for, so every endpoint is open. In a real version
+  jobs would probably be scoped to a user.
+- **No pagination on `GET /jobs`.** Fine at this scale, would add before
+  job volume got large.
+- **Filtering is just the one `status` query param** since that's the only
+  filter the UI actually needs — didn't build out a general query system.
+- **Delete is a hard delete**, no soft-delete/audit trail. Kept it simple;
+  would reconsider if "who deleted what and when" needed to be answerable.
+- **On a failed status change or delete, the frontend re-fetches the whole
+  list** instead of trying to patch its local state — after a 409/404 I'd
+  rather resync from the server than guess.
 
-### With more time
+### If I had more time
 
-- Server-Sent Events or WebSockets so a second tab sees a status change
-  live instead of needing a manual refresh (the API already returns the
-  canonical row on every mutation, so this is mostly transport work).
-- Structured logging with a request ID, so a `409`/`422` in production logs
-  is traceable to the exact request that caused it.
-- Rate limiting on `POST /jobs` (`@nestjs/throttler`) — a public "create
-  job" endpoint is an easy target for abuse.
-- E2E tests around the transition table and the race condition (the race
-  was verified manually during development — see the concurrency section —
-  but it deserves an automated regression test).
+- Live updates (SSE or websockets) so a second tab sees a status change
+  without a manual refresh — the API already returns the full row on every
+  mutation, so most of the plumbing is already there.
+- Rate limiting on `POST /jobs`, since a public create endpoint is an easy
+  target.
+- Request-ID logging so a `409`/`422` in the logs is traceable back to the
+  exact request that triggered it.
+- An actual automated test for the race condition instead of just the
+  manual `Promise.all` check I ran during development.
 
-## Deployment
-
-Both services are plain Node apps, so any Node host works. Suggested free
-options:
+## Deploying it yourself
 
 ### Backend — Render
 
-1. New **Web Service** → connect this repo → root directory `backend`.
-2. Build command: `npm install && npm run build`
-3. Start command: `npm run start:prod`
-4. Add a persistent disk (Render free tier disk is ephemeral across
-   deploys but survives while the instance is up) mounted wherever
-   `DATABASE_PATH` points, or just accept that a redeploy resets the demo
-   data — fine for this assignment's purposes.
+1. New Web Service → connect this repo, root directory `backend`.
+2. Build: `npm install && npm run build`
+3. Start: `npm run start` (or `npm run start:prod`, same thing)
+4. Free tier is fine. SQLite data resets on redeploy on the free tier —
+   acceptable for a demo, wouldn't be for anything real.
 
 ### Frontend — Vercel / Netlify
 
-1. Import this repo, root directory `frontend`.
-2. Build command: `npm run build`, output directory `dist`.
-3. Set environment variable `VITE_API_URL` to the deployed backend URL.
-
-## Testing performed
-
-- Full CRUD + status-transition flow exercised against the running API
-  (valid transitions, illegal transitions, invalid status strings, 404s
-  after delete).
-- Concurrency: two requests fired at the same job at once (`Promise.all`
-  against two parallel `fetch` calls) confirmed exactly one request wins
-  and the other is rejected rather than both silently applying.
-- Idempotency: repeating a `POST /jobs` with the same `Idempotency-Key`
-  confirmed to return the original job, not a duplicate.
-- `tsc -b` (frontend) and `nest build` (backend) both clean; `npm run lint`
-  clean on the frontend.
+1. Import the repo, root directory `frontend`.
+2. Build: `npm run build`, output: `dist`.
+3. Set `VITE_API_URL` to the Render URL from above.
