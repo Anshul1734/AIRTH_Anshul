@@ -11,8 +11,11 @@ assignment.
 
 | | URL |
 |---|---|
-| Frontend | _add after deploying, see [Deployment](#deployment)_ |
-| Backend API | _add after deploying, see [Deployment](#deployment)_ |
+| Frontend | https://frontend-beta-inky-m3homacvo4.vercel.app/ |
+| Backend API | https://airth-anshul.onrender.com |
+
+Backend is on Render's free tier, so it spins down after ~15 minutes idle —
+the first request after a gap can take 30-50s to wake up.
 
 ## Running locally
 
